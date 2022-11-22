@@ -15,20 +15,6 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-type result struct {
-	Site    string              `json:"site,omitempty"`
-	Body    string              `json:"body,omitempty"`
-	Headers map[string][]string `json:"headers,omitempty"`
-	Code    int                 `json:"resultcode,omitempty"`
-}
-
-type logger struct {
-}
-
-func (l logger) Errorf(format string, v ...interface{}) {}
-func (l logger) Warnf(format string, v ...interface{})  {}
-func (l logger) Debugf(format string, v ...interface{}) {}
-
 var l logger
 
 func main() {
@@ -51,7 +37,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	queue := make(chan string, *parallel*2)
-	results := make(chan result, *parallel*2)
+	results := make(chan Result, *parallel*2)
 
 	pb := progressbar.NewOptions(len(lines),
 		progressbar.OptionEnableColorCodes(true),
@@ -79,12 +65,13 @@ func main() {
 			for site := range queue {
 				code, body, err := r.GetTimeout(buffer, "https://"+site, time.Second*time.Duration(*timeout))
 				if err == nil {
-					results <- result{
+					results <- Result{
 						Site: site,
 						// Headers: resp.Header(),
 						Body: string(body),
 						Code: code,
 					}
+
 					r.CloseIdleConnections()
 					// resp.RawResponse.Body.Close()
 				} else {
@@ -108,7 +95,11 @@ func main() {
 	go func() {
 		for result := range results {
 			jd, _ := json.MarshalIndent(result, "  ", "  ")
-			output.Write(jd)
+			_, err := output.Write(jd)
+			if err != nil {
+				log.Print("Error writing to output file:", err)
+				os.Exit(1)
+			}
 		}
 	}()
 
