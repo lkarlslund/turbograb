@@ -36,6 +36,7 @@ func main() {
 	timeout := flag.Int("timeout", 5, "Timeout after seconds")
 	// retries := flag.Int("retries", 2, "Number of retries")
 	outputfilename := flag.String("output", "results.json", "Results output file name")
+	showerrors := flag.Bool("showerrors", false, "Show errors")
 
 	flag.Parse()
 
@@ -68,7 +69,12 @@ func main() {
 	for i := 0; i < *parallel; i++ {
 		wg.Add(1)
 		go func() {
-			r := fasthttp.Client{}
+			r := fasthttp.Client{
+				NoDefaultUserAgentHeader:      true,
+				DisableHeaderNamesNormalizing: true,
+				MaxConnWaitTimeout:            time.Second * 5,
+				MaxIdleConnDuration:           time.Millisecond,
+			}
 			buffer := make([]byte, 16384)
 			for site := range queue {
 				code, body, err := r.GetTimeout(buffer, "https://"+site, time.Second*time.Duration(*timeout))
@@ -80,6 +86,10 @@ func main() {
 						Code: code,
 					}
 					// resp.RawResponse.Body.Close()
+				} else {
+					if *showerrors {
+						log.Println("Connecting to", site, "error:", err)
+					}
 				}
 				pb.Add(1)
 			}
