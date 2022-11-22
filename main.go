@@ -15,10 +15,10 @@ import (
 )
 
 type result struct {
-	Site    string
-	Body    string
-	Headers map[string][]string
-	Code    int
+	Site    string              `json:"site,omitempty"`
+	Body    string              `json:"body,omitempty"`
+	Headers map[string][]string `json:"headers,omitempty"`
+	Code    int                 `json:"resultcode,omitempty"`
 }
 
 type logger struct {
@@ -87,11 +87,17 @@ func main() {
 		}()
 	}
 
-	resultsdata := make([]result, 0, len(lines))
+	output, err := os.Create(*outputfilename)
+	if err != nil {
+		log.Println("Error creating file:", err)
+		os.Exit(1)
+	}
 
+	output.WriteString("[\n")
 	go func() {
 		for result := range results {
-			resultsdata = append(resultsdata, result)
+			jd, _ := json.MarshalIndent(result, "  ", "  ")
+			output.Write(jd)
 		}
 	}()
 
@@ -106,15 +112,6 @@ func main() {
 
 	close(results)
 
-	jd, err := json.Marshal(resultsdata)
-	if err != nil {
-		log.Println("Error encoding json:", err)
-		os.Exit(1)
-	}
-
-	err = ioutil.WriteFile(*outputfilename, jd, 0660)
-	if err != nil {
-		log.Println("Error writing json:", err)
-		os.Exit(1)
-	}
+	output.WriteString("]\n")
+	output.Close()
 }
