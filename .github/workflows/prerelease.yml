@@ -2,7 +2,7 @@ name: Build and publish pre-release
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   build:
@@ -29,4 +29,3 @@ jobs:
         title: "Development Build"
         files: |
           binaries/*
-          
