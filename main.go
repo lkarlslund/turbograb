@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -32,8 +33,8 @@ var l logger
 
 func main() {
 	sitelist := flag.String("sitelist", "", "File to read sites from, plain text")
-	parallel := flag.Int("parallel", 2048, "Number of parallel requests")
-	timeout := flag.Int("timeout", 5, "Timeout after seconds")
+	parallel := flag.Int("parallel", runtime.NumCPU()*64, "Number of parallel requests")
+	timeout := flag.Int("timeout", 15, "Timeout after seconds")
 	// retries := flag.Int("retries", 2, "Number of retries")
 	outputfilename := flag.String("output", "results.json", "Results output file name")
 	showerrors := flag.Bool("showerrors", false, "Show errors")
@@ -70,10 +71,9 @@ func main() {
 		wg.Add(1)
 		go func() {
 			r := fasthttp.Client{
-				NoDefaultUserAgentHeader:      true,
-				DisableHeaderNamesNormalizing: true,
-				MaxConnWaitTimeout:            time.Second * 5,
-				MaxIdleConnDuration:           time.Millisecond,
+				NoDefaultUserAgentHeader: true,
+				MaxConnWaitTimeout:       time.Second * 240,
+				ReadBufferSize:           128 * 1024,
 			}
 			buffer := make([]byte, 16384)
 			for site := range queue {
@@ -85,6 +85,7 @@ func main() {
 						Body: string(body),
 						Code: code,
 					}
+					r.CloseIdleConnections()
 					// resp.RawResponse.Body.Close()
 				} else {
 					if *showerrors {
