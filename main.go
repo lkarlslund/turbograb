@@ -20,7 +20,7 @@ var l logger
 
 func main() {
 	sitelist := flag.String("sitelist", "", "File to read sites from, plain text")
-	parallel := flag.Int("parallel", runtime.NumCPU()*64, "Number of parallel requests")
+	parallel := flag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
 	timeout := flag.Int("timeout", 15, "Timeout after seconds")
 	retries := flag.Int("retries", 2, "Number of retries")
 	outputfilename := flag.String("output", "", "Results output file name (if blank will use one file per site scanned)")
