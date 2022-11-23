@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	"github.com/schollz/progressbar/v3"
 	"github.com/valyala/fasthttp"
 )
@@ -26,8 +29,15 @@ func main() {
 	outputfilename := flag.String("output", "", "Results output file name (if blank will use one file per site scanned)")
 	useragent := flag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := flag.Bool("showerrors", false, "Show errors")
+	pprof := flag.Bool("pprof", false, "Enable profiling")
 
 	flag.Parse()
+
+	if *pprof {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
 
 	rawsites, err := ioutil.ReadFile(*sitelist)
 	if err != nil {
@@ -37,9 +47,15 @@ func main() {
 
 	lines := strings.Split(string(rawsites), "\n")
 
-	var wg sync.WaitGroup
-	queue := make(chan string, *parallel*2)
-	results := make(chan Result, *parallel*2)
+	var producerWG, consumerWG, writerWG sync.WaitGroup
+	producerQueue := make(chan string, *parallel*2)
+	consumerQueue := make(chan Result, runtime.NumCPU()*2)
+
+	type encoded struct {
+		name string
+		data []byte
+	}
+	encodedQueue := make(chan encoded, runtime.NumCPU()*2)
 
 	pb := progressbar.NewOptions(len(lines),
 		progressbar.OptionEnableColorCodes(true),
@@ -50,39 +66,70 @@ func main() {
 	)
 
 	for i := 0; i < *parallel; i++ {
-		wg.Add(1)
+		producerWG.Add(1)
 		go func() {
 			client := fasthttp.Client{
 				NoDefaultUserAgentHeader: true,
 				ReadBufferSize:           128 * 1024,
 			}
 
-			for site := range queue {
+			var req *fasthttp.Request
+			var resp *fasthttp.Response
+
+			for site := range producerQueue {
 				retriesleft := *retries
+				var redirects int
 				var code int
 				var body, header, errstring string
 				protocol := "https"
+				location := protocol + "://" + site
 			retryloop:
 				for retriesleft > 0 {
-					req := fasthttp.AcquireRequest()
-					resp := fasthttp.AcquireResponse()
-					defer fasthttp.ReleaseRequest(req)
-					defer fasthttp.ReleaseResponse(resp)
+					if req != nil {
+						fasthttp.ReleaseRequest(req)
+						fasthttp.ReleaseResponse(resp)
+					}
+					req = fasthttp.AcquireRequest()
+					resp = fasthttp.AcquireResponse()
 
 					req.Header.SetUserAgent(*useragent)
-					req.SetRequestURI(protocol + "://" + site)
-
+					req.SetRequestURI(location)
 					err := client.DoTimeout(req, resp, time.Second*time.Duration(*timeout))
 
-					if err != nil {
-						errstring = err.Error()
-					} else {
-						errstring = ""
-					}
+					if err == nil {
+						code = resp.Header.StatusCode()
+						if fasthttp.StatusCodeIsRedirect(code) {
+							redirects++
+							if redirects > 3 {
+								err = fasthttp.ErrTooManyRedirects
+								break
+							}
 
-					body = string(resp.Body())
-					header = resp.Header.String()
-					code = resp.StatusCode()
+							newlocation := resp.Header.Peek("Location")
+							if len(newlocation) == 0 {
+								err = fasthttp.ErrMissingLocation
+								break
+							}
+
+							u := fasthttp.AcquireURI()
+							u.Update(location)
+							u.UpdateBytes(newlocation)
+							location = u.String()
+							fasthttp.ReleaseURI(u)
+
+							continue
+						}
+
+						body = string(resp.Body())
+						header = resp.Header.String()
+
+						errstring = ""
+					} else {
+						code = 0
+						header = ""
+						body = ""
+						errstring = err.Error()
+					}
 
 					// code, body, err = r.GetTimeout(buffer, "https://"+site, time.Second*time.Duration(*timeout))
 					client.CloseIdleConnections()
@@ -116,10 +163,24 @@ func main() {
 					Code:   code,
 					Error:  errstring,
 				}
-				results <- result
+				consumerQueue <- result
 				pb.Add(1)
 			}
-			wg.Done()
+			producerWG.Done()
+		}()
+	}
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		consumerWG.Add(1)
+		go func() {
+			for result := range consumerQueue {
+				jd, _ := json.MarshalIndent(result, "", "  ")
+				encodedQueue <- encoded{
+					name: result.Site,
+					data: jd,
+				}
+			}
+			consumerWG.Done()
 		}()
 	}
 
@@ -130,10 +191,10 @@ func main() {
 			os.Exit(1)
 		}
 		output.WriteString("[\n")
+		writerWG.Add(1)
 		go func() {
-			for result := range results {
-				jd, _ := json.MarshalIndent(result, "  ", "  ")
-				_, err := output.Write(jd)
+			for encoded := range encodedQueue {
+				_, err := output.Write(encoded.data)
 				if err != nil {
 					log.Print("Error writing to output file:", err)
 					os.Exit(1)
@@ -141,29 +202,36 @@ func main() {
 			}
 			output.WriteString("]\n")
 			output.Close()
+			writerWG.Done()
 		}()
 	} else {
-		go func() {
-			for result := range results {
-				filename := result.Site + ".json"
-				jd, _ := json.MarshalIndent(result, "", "  ")
-				err := ioutil.WriteFile(filename, jd, 0600)
-				if err != nil {
-					log.Printf("Error writing output file %v: %v", filename, err)
+		for i := 0; i < runtime.NumCPU(); i++ {
+			writerWG.Add(1)
+			go func() {
+				for encoded := range encodedQueue {
+					filename := encoded.name + ".json"
+					err := ioutil.WriteFile(filename, encoded.data, 0600)
+					if err != nil {
+						log.Printf("Error writing output file %v: %v", filename, err)
+					}
 				}
-			}
-		}()
+				writerWG.Done()
+			}()
+		}
 	}
 
 	for _, site := range lines {
 		site = strings.Trim(site, "\r")
-		queue <- site
+		producerQueue <- site
 	}
 
-	close(queue)
-	wg.Wait()
+	close(producerQueue)
+	producerWG.Wait()
 	pb.Finish()
 
-	close(results)
+	close(consumerQueue)
+	consumerWG.Wait()
 
+	close(encodedQueue)
+	writerWG.Wait()
 }
