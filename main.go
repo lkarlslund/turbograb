@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 
+	"github.com/OneOfOne/xxhash"
 	"github.com/schollz/progressbar/v3"
 	"github.com/valyala/fasthttp"
 )
@@ -27,11 +30,14 @@ func main() {
 	timeout := flag.Int("timeout", 15, "Timeout after seconds")
 	retries := flag.Int("retries", 2, "Number of retries")
 	outputfilename := flag.String("output", "", "Results output file name (if blank will use one file per site scanned)")
+	overwrite := flag.Bool("overwrite", true, "Overwrite existing files, set to false with many hosts to resume")
 	useragent := flag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := flag.Bool("showerrors", false, "Show errors")
 	pprof := flag.Bool("pprof", false, "Enable profiling")
 
 	flag.Parse()
+
+	onefile := *outputfilename != "" && !strings.HasSuffix(*outputfilename, "\\") && !strings.HasSuffix(*outputfilename, "/")
 
 	if *pprof {
 		go func() {
@@ -46,6 +52,7 @@ func main() {
 	}
 
 	lines := strings.Split(string(rawsites), "\n")
+	items := len(lines)
 
 	var producerWG, consumerWG, writerWG sync.WaitGroup
 	producerQueue := make(chan string, *parallel*2)
@@ -77,6 +84,14 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
+				if !onefile && !*overwrite {
+					if _, err := os.Stat(generateFilename(*outputfilename, site, items)); err == nil {
+						// Exists, skip it (DOES NOT TAKE REDIRECTION INTO ACCOUNT!)
+						pb.Add(1)
+						continue
+					}
+				}
+
 				retriesleft := *retries
 				var redirects int
 				var code int
@@ -184,7 +199,7 @@ func main() {
 		}()
 	}
 
-	if *outputfilename != "" {
+	if onefile {
 		output, err := os.Create(*outputfilename)
 		if err != nil {
 			log.Println("Error creating file:", err)
@@ -209,7 +224,7 @@ func main() {
 			writerWG.Add(1)
 			go func() {
 				for encoded := range encodedQueue {
-					filename := encoded.name + ".json"
+					filename := generateFilename(*outputfilename, encoded.name, items)
 					err := ioutil.WriteFile(filename, encoded.data, 0600)
 					if err != nil {
 						log.Printf("Error writing output file %v: %v", filename, err)
@@ -234,4 +249,22 @@ func main() {
 
 	close(encodedQueue)
 	writerWG.Wait()
+}
+
+func generateFilename(prefix, name string, totalitems int) string {
+	var folder string
+	filename := name + ".json"
+	if totalitems > 1024 {
+		foldercount := uint64(totalitems / 1024)
+		hash := uint64(xxhash.Checksum64S([]byte(name), 0)) % foldercount
+		subfoldername := fmt.Sprintf("%08x", hash)
+		folder = filepath.Join(prefix, subfoldername)
+		filename = filepath.Join(folder, filename)
+	} else {
+		filename = filepath.Join(prefix, filename)
+	}
+	if folder != "" {
+		os.MkdirAll(folder, 0600)
+	}
+	return filename
 }
