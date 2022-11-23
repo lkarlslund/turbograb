@@ -4,10 +4,11 @@ package main
 
 //easyjson:json
 type Result struct {
-	Site    string              `json:"site,omitempty"`
-	Body    string              `json:"body,omitempty"`
-	Headers map[string][]string `json:"headers,omitempty"`
-	Code    int                 `json:"resultcode,omitempty"`
+	Site   string `json:"site,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Header string `json:"headers,omitempty"`
+	Code   int    `json:"resultcode,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 type logger struct {
