@@ -54,8 +54,6 @@ func main() {
 		go func() {
 			client := fasthttp.Client{
 				NoDefaultUserAgentHeader: true,
-				MaxConnWaitTimeout:       time.Second * 240,
-				ReadTimeout:              time.Second * time.Duration(*timeout),
 				ReadBufferSize:           128 * 1024,
 			}
 
@@ -74,7 +72,7 @@ func main() {
 					req.Header.SetUserAgent(*useragent)
 					req.SetRequestURI(protocol + "://" + site)
 
-					err := client.Do(req, resp)
+					err := client.DoTimeout(req, resp, time.Second*time.Duration(*timeout))
 
 					if err != nil {
 						errstring = err.Error()
