@@ -84,6 +84,7 @@ func main() {
 
 					body = string(resp.Body())
 					header = resp.Header.String()
+					code = resp.StatusCode()
 
 					// code, body, err = r.GetTimeout(buffer, "https://"+site, time.Second*time.Duration(*timeout))
 					client.CloseIdleConnections()
