@@ -17,3 +17,8 @@ type logger struct {
 func (l logger) Errorf(format string, v ...interface{}) {}
 func (l logger) Warnf(format string, v ...interface{})  {}
 func (l logger) Debugf(format string, v ...interface{}) {}
+
+type encoded struct {
+	name string
+	data []byte
+}

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -18,6 +20,7 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/OneOfOne/xxhash"
+	"github.com/pierrec/lz4/v4"
 	"github.com/schollz/progressbar/v3"
 	"github.com/valyala/fasthttp"
 )
@@ -25,19 +28,22 @@ import (
 var l logger
 
 func main() {
+	// Grabbing data
 	sitelist := flag.String("sitelist", "", "File to read sites from, plain text")
 	parallel := flag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
 	timeout := flag.Int("timeout", 15, "Timeout after seconds")
 	retries := flag.Int("retries", 2, "Number of retries")
-	outputfilename := flag.String("output", "", "Results output file name (if blank will use one file per site scanned)")
-	overwrite := flag.Bool("overwrite", true, "Overwrite existing files, set to false with many hosts to resume")
 	useragent := flag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := flag.Bool("showerrors", false, "Show errors")
+	// Saving data
+	outputfolder := flag.String("outputfolder", "", "Results output folder name (if blank will use one file per site scanned)")
+	format := flag.String("format", "json", "Output format")
+	compression := flag.Bool("compress", false, "Store LZ4 compressed")
+	recordsperfile := flag.Int("perfile", 10000, "Number of records in each file")
+	// Debugging
 	pprof := flag.Bool("pprof", false, "Enable profiling")
 
 	flag.Parse()
-
-	onefile := *outputfilename != "" && !strings.HasSuffix(*outputfilename, "\\") && !strings.HasSuffix(*outputfilename, "/")
 
 	if *pprof {
 		go func() {
@@ -54,15 +60,10 @@ func main() {
 	lines := strings.Split(string(rawsites), "\n")
 	items := len(lines)
 
-	var producerWG, consumerWG, writerWG sync.WaitGroup
+	var producerWG, writerWG sync.WaitGroup
 	producerQueue := make(chan string, *parallel*2)
-	consumerQueue := make(chan Result, runtime.NumCPU()*2)
 
-	type encoded struct {
-		name string
-		data []byte
-	}
-	encodedQueue := make(chan encoded, runtime.NumCPU()*2)
+	encodedQueue := make(chan encoded, 1024)
 
 	pb := progressbar.NewOptions(len(lines),
 		progressbar.OptionEnableColorCodes(true),
@@ -84,14 +85,6 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
-				if !onefile && !*overwrite {
-					if _, err := os.Stat(generateFilename(*outputfilename, site, items)); err == nil {
-						// Exists, skip it (DOES NOT TAKE REDIRECTION INTO ACCOUNT!)
-						pb.Add(1)
-						continue
-					}
-				}
-
 				retriesleft := *retries
 				var redirects int
 				var code int
@@ -171,6 +164,7 @@ func main() {
 					}
 					retriesleft--
 				}
+
 				result := Result{
 					Site:   site,
 					Header: header,
@@ -178,62 +172,72 @@ func main() {
 					Code:   code,
 					Error:  errstring,
 				}
-				consumerQueue <- result
+
+				var jd []byte
+				switch *format {
+				case "json":
+					jd = generateJSON(result)
+				case "plain":
+					jd = generatePlain(result)
+				default:
+					log.Println("Unknown format", *format)
+					os.Exit(1)
+				}
+				encodedQueue <- encoded{
+					name: result.Site,
+					data: jd,
+				}
 				pb.Add(1)
 			}
 			producerWG.Done()
 		}()
 	}
 
-	for i := 0; i < runtime.NumCPU(); i++ {
-		consumerWG.Add(1)
-		go func() {
-			for result := range consumerQueue {
-				jd, _ := json.MarshalIndent(result, "", "  ")
-				encodedQueue <- encoded{
-					name: result.Site,
-					data: jd,
-				}
-			}
-			consumerWG.Done()
-		}()
-	}
-
-	if onefile {
-		output, err := os.Create(*outputfilename)
-		if err != nil {
-			log.Println("Error creating file:", err)
-			os.Exit(1)
-		}
-		output.WriteString("[\n")
-		writerWG.Add(1)
-		go func() {
-			for encoded := range encodedQueue {
-				_, err := output.Write(encoded.data)
+	writerWG.Add(1)
+	go func() {
+		var written, fileno int
+		var filename string
+		var file *os.File
+		var lz *lz4.Writer
+		var writer io.Writer
+		for encoded := range encodedQueue {
+			if file == nil {
+				filename = generateFilename(*outputfolder, encoded.name, *recordsperfile, fileno, items, *format, *compression)
+				f, err := os.Create(filename)
 				if err != nil {
-					log.Print("Error writing to output file:", err)
+					log.Printf("Error creating output file %v: %v", filename, err)
 					os.Exit(1)
 				}
-			}
-			output.WriteString("]\n")
-			output.Close()
-			writerWG.Done()
-		}()
-	} else {
-		for i := 0; i < runtime.NumCPU(); i++ {
-			writerWG.Add(1)
-			go func() {
-				for encoded := range encodedQueue {
-					filename := generateFilename(*outputfilename, encoded.name, items)
-					err := ioutil.WriteFile(filename, encoded.data, 0600)
-					if err != nil {
-						log.Printf("Error writing output file %v: %v", filename, err)
-					}
+				file = f
+				writer = f
+				if *compression {
+					lz = lz4.NewWriter(file)
+					lz.Apply(
+						lz4.CompressionLevelOption(lz4.Level9),
+						lz4.ConcurrencyOption(-1),
+						lz4.BlockSizeOption(lz4.Block4Mb),
+					)
+					writer = lz
 				}
-				writerWG.Done()
-			}()
+			}
+
+			_, err := writer.Write(encoded.data)
+			if err != nil {
+				log.Printf("Error writing output file %v: %v", filename, err)
+			}
+			written++
+			if written == *recordsperfile {
+				if *compression {
+					lz.Close()
+				}
+				file.Close()
+				file = nil
+				written = 0
+				fileno++
+			}
 		}
-	}
+		writerWG.Done()
+	}()
 
 	for _, site := range lines {
 		site = strings.Trim(site, "\r")
@@ -244,27 +248,60 @@ func main() {
 	producerWG.Wait()
 	pb.Finish()
 
-	close(consumerQueue)
-	consumerWG.Wait()
-
 	close(encodedQueue)
 	writerWG.Wait()
 }
 
-func generateFilename(prefix, name string, totalitems int) string {
-	var folder string
-	filename := name + ".json"
-	if totalitems > 1024 {
-		foldercount := uint64(totalitems / 1024)
+func generateFilename(folder, name string, itemsperfile, currentfile, totalitems int, format string, compression bool) string {
+	filename := name
+	if totalitems/itemsperfile > 1024 {
+		foldercount := uint64(totalitems / itemsperfile / 1024)
 		hash := uint64(xxhash.Checksum64S([]byte(name), 0)) % foldercount
-		subfoldername := fmt.Sprintf("%08x", hash)
-		folder = filepath.Join(prefix, subfoldername)
+		subfoldername := fmt.Sprintf("%03x", hash)
+		folder = filepath.Join(folder, subfoldername)
+
 		filename = filepath.Join(folder, filename)
 	} else {
-		filename = filepath.Join(prefix, filename)
+		filename = filepath.Join(folder, filename)
 	}
+
 	if folder != "" {
 		os.MkdirAll(folder, 0600)
+	} else {
+		filename += fmt.Sprintf("-%09d", currentfile)
+	}
+
+	filename += "." + format
+	if compression {
+		filename += ".lz4"
 	}
 	return filename
+}
+
+func generateJSON(data Result) []byte {
+	result, _ := json.Marshal(data)
+	return result
+}
+
+func generatePlain(data Result) []byte {
+	var buffer bytes.Buffer
+	buffer.Grow(len(data.Header) + len(data.Body) + 128)
+
+	buffer.WriteString("*URL: ")
+	buffer.WriteString(data.Site)
+	buffer.WriteString("\n")
+
+	if data.Error != "" {
+		buffer.WriteString("*Error: ")
+		buffer.WriteString(data.Error)
+		buffer.WriteString("\n")
+	} else {
+		buffer.WriteString(fmt.Sprintf("*Resultcode: %v\n", data.Code))
+		buffer.WriteString("-----\n")
+		buffer.WriteString(data.Header)
+		buffer.WriteString("=====\n")
+		buffer.WriteString(data.Body)
+	}
+	buffer.WriteString("+++++\n")
+	return buffer.Bytes()
 }
