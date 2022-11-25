@@ -301,6 +301,7 @@ func generatePlain(data Result) []byte {
 		buffer.WriteString(data.Header)
 		buffer.WriteString("=====\n")
 		buffer.WriteString(data.Body)
+		buffer.WriteString("\n")
 	}
 	buffer.WriteString("+++++\n")
 	return buffer.Bytes()

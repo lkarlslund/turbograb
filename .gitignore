@@ -1,2 +1,6 @@
 ﻿.vscode
 binaries
+*.txt
+*.lz4
+*.json
+*.exe
