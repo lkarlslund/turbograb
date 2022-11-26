@@ -50,9 +50,10 @@ func main() {
 	queue := make(chan string, runtime.NumCPU())
 	var queueWG sync.WaitGroup
 
-	for i := 0; i < runtime.NumCPU()/4; i++ {
+	for i := 0; i < runtime.NumCPU(); i++ {
 		queueWG.Add(1)
 		siteresults := make([]any, len(compiledRegexes))
+		buffer := make([]byte, 32000000)
 		go func() {
 			for file := range queue {
 				var reader io.Reader
@@ -62,7 +63,7 @@ func main() {
 					continue
 				}
 
-				buf := bufio.NewReaderSize(raw, 16384*1024)
+				buf := bufio.NewReaderSize(raw, len(buffer))
 
 				reader = buf
 
@@ -70,28 +71,40 @@ func main() {
 					lzr := lz4.NewReader(buf)
 					reader = lzr
 				}
-				data, err := io.ReadAll(reader)
-				if err != nil {
-					log.Print("Error reading data into memory:", err)
-					continue
-				}
-
-				fmt.Printf("File %v loaded %v bytes\n", file, len(data))
 
 				var matches int
-				var sitecount int
-				sitedata := data
-				for {
-					sitecount++
-					end := bytes.Index(sitedata, splittoken)
-					siteinfo := sitedata
-					if end >= 0 {
-						siteinfo = sitedata[:end]
+				var records int
+
+				// fmt.Printf("File %v loaded %v bytes\n", file, len(chunk))
+
+				scan := bufio.NewScanner(reader)
+				scan.Buffer(buffer, len(buffer))
+				scan.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+					// No idea how this makes sense
+					if atEOF && len(data) == 0 {
+						return 0, nil, nil
 					}
+					// Delimited record
+					end := bytes.Index(data, splittoken)
+					if end >= 0 {
+						return end + len(splittoken), data[:end], nil // We got one
+					}
+					// Final record
+					if atEOF {
+						return 0, data, bufio.ErrFinalToken
+					}
+					// Please read more data
+					return 0, nil, nil
+				})
+
+				for scan.Scan() {
+					record := scan.Bytes()
+
+					records++
 
 					localresults := 0
 					for ri, re := range compiledRegexes {
-						results := re.FindSubmatch(siteinfo)
+						results := re.FindSubmatch(record)
 						for i := 1; i < len(results); i++ {
 							localresults++
 							siteresults[ri] = results[i]
@@ -101,16 +114,10 @@ func main() {
 						matches++
 						fmt.Fprintf(out, *format, siteresults...)
 					}
-
-					if end >= 0 {
-						sitedata = sitedata[end+len(splittoken):]
-					} else {
-						break
-					}
 				}
 
-				fmt.Printf("File %v has %v matches in %v sites\n", file, matches, sitecount)
 				raw.Close()
+				fmt.Printf("File %v has %v matches in %v sites\n", file, matches, records)
 			}
 			queueWG.Done()
 		}()
