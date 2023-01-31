@@ -5,10 +5,11 @@ package main
 //easyjson:json
 type Result struct {
 	Site   string `json:"site,omitempty"`
-	Body   string `json:"body,omitempty"`
-	Header string `json:"headers,omitempty"`
+	Path   string `json:"path,omitempty"`
 	Code   int    `json:"resultcode,omitempty"`
 	Error  string `json:"error,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Header string `json:"headers,omitempty"`
 }
 
 type logger struct {

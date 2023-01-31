@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,10 +17,12 @@ import (
 
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 
 	"github.com/OneOfOne/xxhash"
 	"github.com/pierrec/lz4/v4"
 	"github.com/schollz/progressbar/v3"
+	"github.com/spf13/pflag"
 	"github.com/valyala/fasthttp"
 )
 
@@ -29,26 +30,40 @@ var l logger
 
 func main() {
 	// Grabbing data
-	sitelist := flag.String("sitelist", "", "File to read sites from, plain text")
-	parallel := flag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
-	timeout := flag.Int("timeout", 15, "Timeout after seconds")
-	retries := flag.Int("retries", 2, "Number of retries")
-	useragent := flag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
-	showerrors := flag.Bool("showerrors", false, "Show errors")
-	// Saving data
-	outputfolder := flag.String("outputfolder", "", "Results output folder name (if blank will use one file per site scanned)")
-	format := flag.String("format", "json", "Output format")
-	compression := flag.Bool("compress", false, "Store LZ4 compressed")
-	recordsperfile := flag.Int("perfile", 10000, "Number of records in each file")
-	// Debugging
-	pprof := flag.Bool("pprof", false, "Enable profiling")
+	sitelist := pflag.String("sitelist", "", "File to read sites from, plain text")
+	urlpaths := pflag.StringSlice("urlpath", []string{"/"}, "Path to grab")
+	storecodes := pflag.IntSlice("storecodes", nil, "Return codes to store data from (default blank, means save all)")
+	parallel := pflag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
+	timeout := pflag.Int("timeout", 15, "Timeout after seconds")
+	retries := pflag.Int("retries", 2, "Number of retries")
+	useragent := pflag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
+	showerrors := pflag.Bool("showerrors", false, "Show errors")
 
-	flag.Parse()
+	// Saving data
+	outputfolder := pflag.String("outputfolder", "", "Results output folder name (if blank will use one file per site scanned)")
+	format := pflag.String("format", "json", "Output format (plain, json)")
+	compression := pflag.Bool("compress", false, "Store LZ4 compressed")
+	recordsperfile := pflag.Int("perfile", 10000, "Number of records in each file")
+
+	// Debugging
+	pprof := pflag.Bool("pprof", false, "Enable profiling")
+
+	pflag.Parse()
 
 	if *pprof {
 		go func() {
 			log.Println(http.ListenAndServe("localhost:6060", nil))
 		}()
+	}
+
+	timeoutDuration := time.Second * time.Duration(*timeout)
+
+	var codes map[int]struct{}
+	if len(*storecodes) > 0 {
+		codes = make(map[int]struct{})
+		for _, code := range *storecodes {
+			codes[code] = struct{}{}
+		}
 	}
 
 	rawsites, err := ioutil.ReadFile(*sitelist)
@@ -79,6 +94,8 @@ func main() {
 			client := fasthttp.Client{
 				NoDefaultUserAgentHeader: true,
 				ReadBufferSize:           128 * 1024,
+				WriteTimeout:             timeoutDuration,
+				ReadTimeout:              timeoutDuration,
 			}
 
 			var req *fasthttp.Request
@@ -90,7 +107,15 @@ func main() {
 				var code int
 				var body, header, errstring string
 				protocol := "https"
-				location := protocol + "://" + site
+
+				urlpathindex := 0
+				urlpath := (*urlpaths)[urlpathindex]
+
+				location, err := url.JoinPath(protocol+"://"+site, urlpath)
+				if err != nil {
+					log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, site, urlpath, err)
+					continue
+				}
 			retryloop:
 				for retriesleft > 0 {
 					if req != nil {
@@ -102,7 +127,7 @@ func main() {
 
 					req.Header.SetUserAgent(*useragent)
 					req.SetRequestURI(location)
-					err := client.DoTimeout(req, resp, time.Second*time.Duration(*timeout))
+					err = client.DoTimeout(req, resp, timeoutDuration)
 
 					if err == nil {
 						code = resp.Header.StatusCode()
@@ -110,13 +135,13 @@ func main() {
 							redirects++
 							if redirects > 3 {
 								err = fasthttp.ErrTooManyRedirects
-								break
+								break retryloop
 							}
 
 							newlocation := resp.Header.Peek("Location")
 							if len(newlocation) == 0 {
 								err = fasthttp.ErrMissingLocation
-								break
+								break retryloop
 							}
 
 							u := fasthttp.AcquireURI()
@@ -125,21 +150,31 @@ func main() {
 							location = u.String()
 							fasthttp.ReleaseURI(u)
 
-							continue
+							continue // retry
+						} else if code != 200 && urlpathindex+1 < len(*urlpaths) {
+							urlpathindex++
+							urlpath = (*urlpaths)[urlpathindex]
+
+							u := fasthttp.AcquireURI()
+							u.Update(location)
+							u.Update(urlpath)
+							location = u.String()
+							fasthttp.ReleaseURI(u)
+
+							continue // retry
 						}
 
 						body = string(resp.Body())
 						header = resp.Header.String()
-
 						errstring = ""
-					} else {
-						code = 0
-						header = ""
-						body = ""
-						errstring = err.Error()
+
+						break retryloop
 					}
 
-					// code, body, err = r.GetTimeout(buffer, "https://"+site, time.Second*time.Duration(*timeout))
+					code = 0
+					header = ""
+					body = ""
+
 					client.CloseIdleConnections()
 
 					switch e := err.(type) {
@@ -150,14 +185,16 @@ func main() {
 						}
 						// Just give up
 						break retryloop
-					case nil:
-						break retryloop
 					default:
-						if e.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
+						if e == fasthttp.ErrNoFreeConns {
+							time.Sleep(time.Second)
+							continue // try again, but it doesn't cost a retry
+						} else if e.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
 
 						} else {
 							// other errors
 						}
+
 						if *showerrors {
 							log.Println("Connecting to", site, "error:", e)
 						}
@@ -165,8 +202,20 @@ func main() {
 					retriesleft--
 				}
 
+				// Check if we should save this or not
+				if codes != nil {
+					if _, found := codes[code]; !found {
+						continue
+					}
+				}
+
+				if err != nil {
+					errstring = err.Error()
+				}
+
 				result := Result{
 					Site:   site,
+					Path:   location,
 					Header: header,
 					Body:   body,
 					Code:   code,
@@ -187,7 +236,6 @@ func main() {
 					name: result.Site,
 					data: jd,
 				}
-				pb.Add(1)
 			}
 			producerWG.Done()
 		}()
@@ -242,6 +290,7 @@ func main() {
 	for _, site := range lines {
 		site = strings.Trim(site, "\r")
 		producerQueue <- site
+		pb.Add(1)
 	}
 
 	close(producerQueue)
@@ -289,6 +338,10 @@ func generatePlain(data Result) []byte {
 
 	buffer.WriteString("*URL: ")
 	buffer.WriteString(data.Site)
+	buffer.WriteString("\n")
+
+	buffer.WriteString("*Path: ")
+	buffer.WriteString(data.Path)
 	buffer.WriteString("\n")
 
 	if data.Error != "" {
