@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -44,6 +43,7 @@ func main() {
 	format := pflag.String("format", "json", "Output format (plain, json)")
 	compression := pflag.Bool("compress", false, "Store LZ4 compressed")
 	recordsperfile := pflag.Int("perfile", 10000, "Number of records in each file")
+	skipexisting := pflag.Bool("skipexisting", false, "Skip existing files, only works with perfile=1")
 
 	// Debugging
 	pprof := pflag.Bool("pprof", false, "Enable profiling")
@@ -66,7 +66,7 @@ func main() {
 		}
 	}
 
-	rawsites, err := ioutil.ReadFile(*sitelist)
+	rawsites, err := os.ReadFile(*sitelist)
 	if err != nil {
 		log.Println("Error reading sitelist file:", err)
 		os.Exit(1)
@@ -102,6 +102,11 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
+				if *recordsperfile == 1 && *skipexisting {
+					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, 0, items, *format, *compression)); err == nil {
+						continue
+					}
+				}
 				retriesleft := *retries
 				var redirects int
 				var code int
@@ -123,7 +128,9 @@ func main() {
 						fasthttp.ReleaseResponse(resp)
 					}
 					req = fasthttp.AcquireRequest()
+					req.SetConnectionClose()
 					resp = fasthttp.AcquireResponse()
+					resp.SetConnectionClose()
 
 					req.Header.SetUserAgent(*useragent)
 					req.SetRequestURI(location)
