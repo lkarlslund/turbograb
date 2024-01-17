@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"crypto/tls"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -91,7 +92,15 @@ func main() {
 	for i := 0; i < *parallel; i++ {
 		producerWG.Add(1)
 		go func() {
-			client := fasthttp.Client{
+			var err error
+			secureclient := fasthttp.Client{
+				NoDefaultUserAgentHeader: true,
+				ReadBufferSize:           128 * 1024,
+				WriteTimeout:             timeoutDuration,
+				ReadTimeout:              timeoutDuration,
+			}
+			insecureclient := fasthttp.Client{
+				TLSConfig:                &tls.Config{InsecureSkipVerify: true},
 				NoDefaultUserAgentHeader: true,
 				ReadBufferSize:           128 * 1024,
 				WriteTimeout:             timeoutDuration,
@@ -102,6 +111,7 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
+				client := &secureclient
 				if *recordsperfile == 1 && *skipexisting {
 					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, 0, items, *format, *compression)); err == nil {
 						continue
@@ -116,13 +126,17 @@ func main() {
 				urlpathindex := 0
 				urlpath := (*urlpaths)[urlpathindex]
 
-				location, err := url.JoinPath(protocol+"://"+site, urlpath)
-				if err != nil {
-					log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, site, urlpath, err)
-					continue
-				}
+				var warnings []string
+				var siteurl string
+				host := site
 			retryloop:
 				for retriesleft > 0 {
+					siteurl, err = url.JoinPath(protocol+"://"+host, urlpath)
+					if err != nil {
+						log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, host, urlpath, err)
+						break
+					}
+
 					if req != nil {
 						fasthttp.ReleaseRequest(req)
 						fasthttp.ReleaseResponse(resp)
@@ -133,7 +147,7 @@ func main() {
 					resp.SetConnectionClose()
 
 					req.Header.SetUserAgent(*useragent)
-					req.SetRequestURI(location)
+					req.SetRequestURI(siteurl)
 					err = client.DoTimeout(req, resp, timeoutDuration)
 
 					if err == nil {
@@ -152,9 +166,9 @@ func main() {
 							}
 
 							u := fasthttp.AcquireURI()
-							u.Update(location)
+							u.Update(siteurl)
 							u.UpdateBytes(newlocation)
-							location = u.String()
+							siteurl = u.String()
 							fasthttp.ReleaseURI(u)
 
 							continue // retry
@@ -162,10 +176,11 @@ func main() {
 							urlpathindex++
 							urlpath = (*urlpaths)[urlpathindex]
 
+							// WTF!?!?!?
 							u := fasthttp.AcquireURI()
-							u.Update(location)
+							u.Update(siteurl)
 							u.Update(urlpath)
-							location = u.String()
+							siteurl = u.String()
 							fasthttp.ReleaseURI(u)
 
 							continue // retry
@@ -184,27 +199,46 @@ func main() {
 
 					client.CloseIdleConnections()
 
-					switch e := err.(type) {
-					case *net.DNSError:
-						if !strings.HasPrefix(site, "www.") {
-							site = "www." + site
+					if err == fasthttp.ErrNoFreeConns {
+						time.Sleep(time.Second)
+						continue // try again, but it doesn't cost a retry
+					} else if _, ok := err.(*net.DNSError); ok {
+						if !strings.HasPrefix(host, "www.") {
+							host = "www." + host
+							warnings = append(warnings, "prefix_www")
 							continue // loop without using a retry
 						}
 						// Just give up
 						break retryloop
-					default:
-						if e == fasthttp.ErrNoFreeConns {
-							time.Sleep(time.Second)
-							continue // try again, but it doesn't cost a retry
-						} else if e.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
+					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate is valid for") {
+						// Ignore bad certs
+						warnings = append(warnings, "tls_wrong_host")
+						client = &insecureclient
+					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate signed by unknown authority") {
+						warnings = append(warnings, "tls_unknown_authority")
+						client = &insecureclient
+					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate has expired or is not yet valid") {
+						warnings = append(warnings, "tls_expired_cert")
+						client = &insecureclient
+					} else if err.Error() == "remote error: tls: internal error" {
+						warnings = append(warnings, "unencrypted_http_failback")
+						protocol = "http"
+					} else if strings.Contains(err.Error(), "connectex: No connection could be made because the target machine actively refused it") {
+						// Give up
+						warnings = append(warnings, "connection_refused")
+						break retryloop
+					} else if err.Error() == "too many redirects detected when doing the request" {
+						break retryloop
+					} else if err.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
 
-						} else {
-							// other errors
-						}
+					} else {
+						// other errors
+					}
 
-						if *showerrors {
-							log.Println("Connecting to", site, "error:", e)
-						}
+					time.Sleep(time.Second)
+
+					if *showerrors {
+						log.Println("Connecting to", siteurl, "error:", err.Error())
 					}
 					retriesleft--
 				}
@@ -221,12 +255,13 @@ func main() {
 				}
 
 				result := Result{
-					Site:   site,
-					Path:   location,
-					Header: header,
-					Body:   body,
-					Code:   code,
-					Error:  errstring,
+					Site:     site,
+					URL:      siteurl,
+					Header:   header,
+					Body:     body,
+					Code:     code,
+					Error:    errstring,
+					Warnings: warnings,
 				}
 
 				var jd []byte
@@ -343,13 +378,19 @@ func generatePlain(data Result) []byte {
 	var buffer bytes.Buffer
 	buffer.Grow(len(data.Header) + len(data.Body) + 128)
 
-	buffer.WriteString("*URL: ")
+	buffer.WriteString("*Site: ")
 	buffer.WriteString(data.Site)
 	buffer.WriteString("\n")
 
-	buffer.WriteString("*Path: ")
-	buffer.WriteString(data.Path)
+	buffer.WriteString("*URL: ")
+	buffer.WriteString(data.URL)
 	buffer.WriteString("\n")
+
+	if len(data.Warnings) > 0 {
+		buffer.WriteString("*Warnings: ")
+		buffer.WriteString(strings.Join(data.Warnings, ", "))
+		buffer.WriteString("\n")
+	}
 
 	if data.Error != "" {
 		buffer.WriteString("*Error: ")
