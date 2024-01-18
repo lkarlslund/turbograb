@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
 
 	"github.com/OneOfOne/xxhash"
+	"github.com/grantae/certinfo"
 	"github.com/pierrec/lz4/v4"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/pflag"
@@ -36,15 +38,17 @@ func main() {
 	storecodes := pflag.IntSlice("storecodes", nil, "Return codes to store data from (default blank, means save all)")
 	parallel := pflag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
 	timeout := pflag.Int("timeout", 15, "Timeout after seconds")
-	retries := pflag.Int("retries", 3, "Number of retries")
+	maxretries := pflag.Int("retries", 10, "Max number of retries")
+	maxredirects := pflag.Int("redirects", 5, "Max number of redirects")
 	useragent := pflag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := pflag.Bool("showerrors", false, "Show errors")
 
 	// Saving data
 	outputfolder := pflag.String("outputfolder", "", "Results output folder name (if blank will use one file per site scanned)")
-	format := pflag.String("format", "json", "Output format (plain, json)")
+	format := pflag.String("format", "json", "Output format (txt, json)")
 	compression := pflag.Bool("compress", false, "Store LZ4 compressed")
 	recordsperfile := pflag.Int("perfile", 10000, "Number of records in each file")
+	buckets := pflag.Int("buckets", 4096, "Number of buckets to place files in")
 	skipexisting := pflag.Bool("skipexisting", false, "Skip existing files, only works with perfile=1")
 
 	// Debugging
@@ -75,12 +79,11 @@ func main() {
 	}
 
 	lines := strings.Split(string(rawsites), "\n")
-	items := len(lines)
 
 	var producerWG, writerWG sync.WaitGroup
-	producerQueue := make(chan string, *parallel*2)
+	producerQueue := make(chan string, *parallel*4)
 
-	encodedQueue := make(chan encoded, 1024)
+	encodedQueue := make(chan encoded, runtime.NumCPU()*4)
 
 	pb := progressbar.NewOptions(len(lines),
 		progressbar.OptionEnableColorCodes(true),
@@ -94,14 +97,21 @@ func main() {
 		producerWG.Add(1)
 		go func() {
 			var err error
+			var certinfo []*x509.Certificate
 			secureclient := fasthttp.Client{
+				TLSConfig: &tls.Config{
+					VerifyPeerCertificate: storecertinfo(&certinfo),
+				},
 				NoDefaultUserAgentHeader: true,
 				ReadBufferSize:           128 * 1024,
 				WriteTimeout:             timeoutDuration,
 				ReadTimeout:              timeoutDuration,
 			}
 			insecureclient := fasthttp.Client{
-				TLSConfig:                &tls.Config{InsecureSkipVerify: true},
+				TLSConfig: &tls.Config{
+					InsecureSkipVerify:    true,
+					VerifyPeerCertificate: storecertinfo(&certinfo),
+				},
 				NoDefaultUserAgentHeader: true,
 				ReadBufferSize:           128 * 1024,
 				WriteTimeout:             timeoutDuration,
@@ -112,14 +122,15 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
+				certinfo = nil
 				client := &secureclient
 				if *recordsperfile == 1 && *skipexisting {
-					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, 0, items, *format, *compression)); err == nil {
+					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, *buckets, *format, *compression)); err == nil {
 						continue
 					}
 				}
-				retriesleft := *retries
-				var redirects int
+				retriesleft := *maxretries
+				redirectsleft := *maxredirects
 				var code int
 				var body, header, errstring string
 				protocol := "https"
@@ -154,8 +165,8 @@ func main() {
 					if err == nil {
 						code = resp.Header.StatusCode()
 						if fasthttp.StatusCodeIsRedirect(code) {
-							redirects++
-							if redirects > 3 {
+							redirectsleft--
+							if redirectsleft == 0 {
 								err = fasthttp.ErrTooManyRedirects
 								break retryloop
 							}
@@ -192,6 +203,7 @@ func main() {
 						}
 
 						body = string(resp.Body())
+
 						header = resp.Header.String()
 						errstring = ""
 
@@ -261,28 +273,29 @@ func main() {
 				}
 
 				result := Result{
-					Site:     site,
-					URL:      siteurl,
-					Header:   header,
-					Body:     body,
-					Code:     code,
-					Error:    errstring,
-					Warnings: warnings,
+					Site:         site,
+					URL:          siteurl,
+					Certificates: certinfo,
+					Header:       header,
+					Body:         body,
+					Code:         code,
+					Error:        errstring,
+					Warnings:     warnings,
 				}
 
 				var jd []byte
 				switch *format {
 				case "json":
 					jd = generateJSON(result)
-				case "plain":
-					jd = generatePlain(result)
+				case "txt":
+					jd = generateTXT(result)
 				default:
 					log.Println("Unknown format", *format)
 					os.Exit(1)
 				}
 				encodedQueue <- encoded{
-					name: result.Site,
-					data: jd,
+					Site: result.Site,
+					Data: jd,
 				}
 			}
 			producerWG.Done()
@@ -298,7 +311,7 @@ func main() {
 		var writer io.Writer
 		for encoded := range encodedQueue {
 			if file == nil {
-				filename = generateFilename(*outputfolder, encoded.name, *recordsperfile, fileno, items, *format, *compression)
+				filename = generateFilename(*outputfolder, encoded.Site, *recordsperfile, *buckets, *format, *compression)
 				f, err := os.Create(filename)
 				if err != nil {
 					log.Printf("Error creating output file %v: %v", filename, err)
@@ -317,7 +330,7 @@ func main() {
 				}
 			}
 
-			_, err := writer.Write(encoded.data)
+			_, err := writer.Write(encoded.Data)
 			if err != nil {
 				log.Printf("Error writing output file %v: %v", filename, err)
 			}
@@ -349,12 +362,12 @@ func main() {
 	writerWG.Wait()
 }
 
-func generateFilename(folder, name string, itemsperfile, currentfile, totalitems int, format string, compression bool) string {
+func generateFilename(folder, name string, itemsperfile, buckets int, format string, compression bool) string {
 	filename := name
-	if totalitems/itemsperfile > 1024 {
-		foldercount := uint64(totalitems / itemsperfile / 1024)
-		hash := uint64(xxhash.Checksum64S([]byte(name), 0)) % foldercount
-		subfoldername := fmt.Sprintf("%03x", hash)
+
+	if buckets > 1 {
+		hashbucket := uint64(xxhash.Checksum64S([]byte(name), 0)) % uint64(buckets)
+		subfoldername := fmt.Sprintf("%04x", hashbucket)
 		folder = filepath.Join(folder, subfoldername)
 
 		filename = filepath.Join(folder, filename)
@@ -364,8 +377,6 @@ func generateFilename(folder, name string, itemsperfile, currentfile, totalitems
 
 	if folder != "" {
 		os.MkdirAll(folder, 0600)
-	} else {
-		filename += fmt.Sprintf("-%09d", currentfile)
 	}
 
 	filename += "." + format
@@ -380,7 +391,7 @@ func generateJSON(data Result) []byte {
 	return result
 }
 
-func generatePlain(data Result) []byte {
+func generateTXT(data Result) []byte {
 	var buffer bytes.Buffer
 	buffer.Grow(len(data.Header) + len(data.Body) + 128)
 
@@ -404,6 +415,20 @@ func generatePlain(data Result) []byte {
 		buffer.WriteString("\n")
 	} else {
 		buffer.WriteString(fmt.Sprintf("*Resultcode: %v\n", data.Code))
+	}
+
+	if len(data.Certificates) > 0 {
+		for _, cert := range data.Certificates {
+			info, err := certinfo.CertificateText(cert)
+			if err != nil {
+				continue
+			}
+			buffer.WriteString("*****\n")
+			buffer.WriteString(info)
+		}
+	}
+
+	if data.Error == "" {
 		buffer.WriteString("-----\n")
 		buffer.WriteString(data.Header)
 		buffer.WriteString("=====\n")
@@ -412,4 +437,19 @@ func generatePlain(data Result) []byte {
 	}
 	buffer.WriteString("+++++\n")
 	return buffer.Bytes()
+}
+
+func storecertinfo(store *[]*x509.Certificate) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		*store = make([]*x509.Certificate, 0, len(rawCerts))
+		for _, rawCert := range rawCerts {
+			cert, err := x509.ParseCertificate(rawCert)
+			if err != nil {
+				fmt.Printf("Error parsing certificate: %v\n", err)
+				continue
+			}
+			*store = append(*store, cert)
+		}
+		return nil
+	}
 }
