@@ -31,11 +31,12 @@ var l logger
 func main() {
 	// Grabbing data
 	sitelist := pflag.String("sitelist", "", "File to read sites from, plain text")
+
 	urlpaths := pflag.StringSlice("urlpath", []string{"/"}, "Path to grab")
 	storecodes := pflag.IntSlice("storecodes", nil, "Return codes to store data from (default blank, means save all)")
 	parallel := pflag.Int("parallel", runtime.NumCPU()*32, "Number of parallel requests")
 	timeout := pflag.Int("timeout", 15, "Timeout after seconds")
-	retries := pflag.Int("retries", 2, "Number of retries")
+	retries := pflag.Int("retries", 3, "Number of retries")
 	useragent := pflag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := pflag.Bool("showerrors", false, "Show errors")
 
@@ -165,23 +166,27 @@ func main() {
 								break retryloop
 							}
 
-							u := fasthttp.AcquireURI()
-							u.Update(siteurl)
-							u.UpdateBytes(newlocation)
-							siteurl = u.String()
-							fasthttp.ReleaseURI(u)
+							baseurl, err := url.Parse(siteurl)
+							if err != nil {
+								err = fmt.Errorf("error parsing base URL %v: %v", siteurl, err)
+								break retryloop
+							}
 
+							relativeurl, err := url.Parse(string(newlocation))
+							if err != nil {
+								err = fmt.Errorf("error parsing redirect location %v: %v", newlocation, err)
+								break retryloop
+							}
+
+							newurl := baseurl.ResolveReference(relativeurl)
+
+							host = newurl.Host
+							urlpath = newurl.Path
+							protocol = newurl.Scheme
 							continue // retry
 						} else if code != 200 && urlpathindex+1 < len(*urlpaths) {
 							urlpathindex++
 							urlpath = (*urlpaths)[urlpathindex]
-
-							// WTF!?!?!?
-							u := fasthttp.AcquireURI()
-							u.Update(siteurl)
-							u.Update(urlpath)
-							siteurl = u.String()
-							fasthttp.ReleaseURI(u)
 
 							continue // retry
 						}
@@ -227,7 +232,8 @@ func main() {
 						// Give up
 						warnings = append(warnings, "connection_refused")
 						break retryloop
-					} else if err.Error() == "too many redirects detected when doing the request" {
+					} else if err == fasthttp.ErrTooManyRedirects {
+						// Give up
 						break retryloop
 					} else if err.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
 
