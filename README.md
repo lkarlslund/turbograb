@@ -1,6 +1,9 @@
-# grabASS
-Grab Accelerated Site Stuff
+# turbograb
+Grab the content of lots of websites in parallel
 ```
-./grabASS --sitefile=yoursites.txt --parallel=4096 --timeout=5 --output=results.json --showerrors=true
+turbograb --sitefile=yoursites.txt --parallel=4096 --timeout=5 --outputpath=/my/results --showerrors=true
 ```
+
+
+
 Dedicated to my friend mr-r3b00t

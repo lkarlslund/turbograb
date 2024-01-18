@@ -1,4 +1,4 @@
-module github.com/lkarlslund/grabASS
+module github.com/lkarlslund/turbograb
 
 go 1.21
 

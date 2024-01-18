@@ -31,5 +31,5 @@ Set-Location $PSScriptRoot
 
 # Release
 $BUILDER = "go"
-BuildVariants -ldflags "$LDFLAGS -w -s" ./grabASS
-BuildVariants -ldflags "$LDFLAGS -w -s" ./grepASS
+BuildVariants -ldflags "$LDFLAGS -w -s" ./cmd/turbograb
+# BuildVariants -ldflags "$LDFLAGS -w -s" ./cmd/turbogrep

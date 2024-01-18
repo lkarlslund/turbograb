@@ -1,4 +1,4 @@
-package main
+package turbograb
 
 import "crypto/x509"
 
@@ -16,14 +16,7 @@ type Result struct {
 	Header       string              `json:"headers,omitempty"`
 }
 
-type logger struct {
-}
-
-func (l logger) Errorf(format string, v ...interface{}) {}
-func (l logger) Warnf(format string, v ...interface{})  {}
-func (l logger) Debugf(format string, v ...interface{}) {}
-
-type encoded struct {
+type Encoded struct {
 	Site string
 	Data []byte
 }

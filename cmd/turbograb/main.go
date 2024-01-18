@@ -22,13 +22,12 @@ import (
 
 	"github.com/OneOfOne/xxhash"
 	"github.com/grantae/certinfo"
+	"github.com/lkarlslund/turbograb"
 	"github.com/pierrec/lz4/v4"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/pflag"
 	"github.com/valyala/fasthttp"
 )
-
-var l logger
 
 func main() {
 	// Grabbing data
@@ -83,20 +82,21 @@ func main() {
 	var producerWG, writerWG sync.WaitGroup
 	producerQueue := make(chan string, *parallel*4)
 
-	encodedQueue := make(chan encoded, runtime.NumCPU()*4)
+	encodedQueue := make(chan turbograb.Encoded, runtime.NumCPU()*4)
 
 	pb := progressbar.NewOptions(len(lines),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionSetItsString("conn"),
 		progressbar.OptionThrottle(time.Second*2),
+		progressbar.OptionFullWidth(),
 		progressbar.OptionShowIts(),
 		progressbar.OptionShowCount(),
 	)
 
+	// Producers
 	for i := 0; i < *parallel; i++ {
 		producerWG.Add(1)
 		go func() {
-			var err error
 			var certinfo []*x509.Certificate
 			secureclient := fasthttp.Client{
 				TLSConfig: &tls.Config{
@@ -122,6 +122,7 @@ func main() {
 			var resp *fasthttp.Response
 
 			for site := range producerQueue {
+				var siteerr error
 				certinfo = nil
 				client := &secureclient
 				if *recordsperfile == 1 && *skipexisting {
@@ -138,14 +139,17 @@ func main() {
 				urlpathindex := 0
 				urlpath := (*urlpaths)[urlpathindex]
 
+				closerequest := true
+				justnotcloserequest := false
+
 				var warnings []string
 				var siteurl string
 				host := site
 			retryloop:
 				for retriesleft > 0 {
-					siteurl, err = url.JoinPath(protocol+"://"+host, urlpath)
-					if err != nil {
-						log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, host, urlpath, err)
+					siteurl, siteerr = url.JoinPath(protocol+"://"+host, urlpath)
+					if siteerr != nil {
+						log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, host, urlpath, siteerr)
 						break
 					}
 
@@ -154,45 +158,87 @@ func main() {
 						fasthttp.ReleaseResponse(resp)
 					}
 					req = fasthttp.AcquireRequest()
-					req.SetConnectionClose()
 					resp = fasthttp.AcquireResponse()
-					resp.SetConnectionClose()
+					if closerequest {
+						req.SetConnectionClose()
+						resp.SetConnectionClose()
+					}
 
 					req.Header.SetUserAgent(*useragent)
 					req.SetRequestURI(siteurl)
-					err = client.DoTimeout(req, resp, timeoutDuration)
+					siteerr = client.DoTimeout(req, resp, timeoutDuration)
 
-					if err == nil {
+					if siteerr == nil {
 						code = resp.Header.StatusCode()
 						if fasthttp.StatusCodeIsRedirect(code) {
+							warnings = append(warnings, "redirect")
+
 							redirectsleft--
 							if redirectsleft == 0 {
-								err = fasthttp.ErrTooManyRedirects
+								siteerr = fasthttp.ErrTooManyRedirects
 								break retryloop
 							}
 
 							newlocation := resp.Header.Peek("Location")
 							if len(newlocation) == 0 {
-								err = fasthttp.ErrMissingLocation
+								siteerr = fasthttp.ErrMissingLocation
 								break retryloop
 							}
 
-							baseurl, err := url.Parse(siteurl)
-							if err != nil {
-								err = fmt.Errorf("error parsing base URL %v: %v", siteurl, err)
+							var baseurl *url.URL
+							baseurl, siteerr = url.Parse(siteurl)
+							if siteerr != nil {
+								siteerr = fmt.Errorf("error parsing base URL %v: %v", siteurl, siteerr)
 								break retryloop
 							}
 
-							relativeurl, err := url.Parse(string(newlocation))
-							if err != nil {
-								err = fmt.Errorf("error parsing redirect location %v: %v", newlocation, err)
+							var relativeurl *url.URL
+							relativeurl, siteerr = url.Parse(string(newlocation))
+							if siteerr != nil {
+								siteerr = fmt.Errorf("error parsing redirect location %v: %v", newlocation, siteerr)
 								break retryloop
 							}
 
 							newurl := baseurl.ResolveReference(relativeurl)
 
+							var newsiteurl string
+							newsiteurl, siteerr = url.JoinPath(newurl.Scheme+"://"+newurl.Host, newurl.Path)
+							if siteerr != nil {
+								siteerr = fmt.Errorf("error creating new site URL from %v: %v", newurl, siteerr)
+								break retryloop
+							}
+
+							if strings.EqualFold(newsiteurl, siteurl) {
+								if !justnotcloserequest {
+									warnings = append(warnings, "redirect_to_self")
+									if closerequest {
+										closerequest = false
+										justnotcloserequest = true
+									} else {
+										siteerr = fasthttp.ErrTooManyRedirects
+										break retryloop
+									}
+								} else {
+									justnotcloserequest = false
+								}
+							}
+
+							if host != newurl.Host {
+								warnings = append(warnings, "redirect_to_other_host")
+							}
+
 							host = newurl.Host
+
+							if urlpath != newurl.Path {
+								warnings = append(warnings, "redirect_to_other_path")
+							}
+
 							urlpath = newurl.Path
+
+							if protocol == "https" && newurl.Scheme == "http" {
+								warnings = append(warnings, "https_to_http_redirect")
+							}
+
 							protocol = newurl.Scheme
 							continue // retry
 						} else if code != 200 && urlpathindex+1 < len(*urlpaths) {
@@ -216,10 +262,10 @@ func main() {
 
 					client.CloseIdleConnections()
 
-					if err == fasthttp.ErrNoFreeConns {
+					if siteerr == fasthttp.ErrNoFreeConns {
 						time.Sleep(time.Second)
 						continue // try again, but it doesn't cost a retry
-					} else if _, ok := err.(*net.DNSError); ok {
+					} else if _, ok := siteerr.(*net.DNSError); ok {
 						if !strings.HasPrefix(host, "www.") {
 							host = "www." + host
 							warnings = append(warnings, "prefix_www")
@@ -227,27 +273,27 @@ func main() {
 						}
 						// Just give up
 						break retryloop
-					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate is valid for") {
+					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate is valid for") {
 						// Ignore bad certs
 						warnings = append(warnings, "tls_wrong_host")
 						client = &insecureclient
-					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate signed by unknown authority") {
+					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate signed by unknown authority") {
 						warnings = append(warnings, "tls_unknown_authority")
 						client = &insecureclient
-					} else if strings.Contains(err.Error(), "tls: failed to verify certificate: x509: certificate has expired or is not yet valid") {
+					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate has expired or is not yet valid") {
 						warnings = append(warnings, "tls_expired_cert")
 						client = &insecureclient
-					} else if err.Error() == "remote error: tls: internal error" {
+					} else if siteerr.Error() == "remote error: tls: internal error" {
 						warnings = append(warnings, "unencrypted_http_failback")
 						protocol = "http"
-					} else if strings.Contains(err.Error(), "connectex: No connection could be made because the target machine actively refused it") {
+					} else if strings.Contains(siteerr.Error(), "connectex: No connection could be made because the target machine actively refused it") {
 						// Give up
 						warnings = append(warnings, "connection_refused")
 						break retryloop
-					} else if err == fasthttp.ErrTooManyRedirects {
+					} else if siteerr == fasthttp.ErrTooManyRedirects {
 						// Give up
 						break retryloop
-					} else if err.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
+					} else if siteerr.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
 
 					} else {
 						// other errors
@@ -256,7 +302,7 @@ func main() {
 					time.Sleep(time.Second)
 
 					if *showerrors {
-						log.Println("Connecting to", siteurl, "error:", err.Error())
+						log.Println("Connecting to", siteurl, "error:", siteerr.Error())
 					}
 					retriesleft--
 				}
@@ -268,11 +314,11 @@ func main() {
 					}
 				}
 
-				if err != nil {
-					errstring = err.Error()
+				if siteerr != nil {
+					errstring = siteerr.Error()
 				}
 
-				result := Result{
+				result := turbograb.Result{
 					Site:         site,
 					URL:          siteurl,
 					Certificates: certinfo,
@@ -293,7 +339,7 @@ func main() {
 					log.Println("Unknown format", *format)
 					os.Exit(1)
 				}
-				encodedQueue <- encoded{
+				encodedQueue <- turbograb.Encoded{
 					Site: result.Site,
 					Data: jd,
 				}
@@ -302,51 +348,57 @@ func main() {
 		}()
 	}
 
-	writerWG.Add(1)
-	go func() {
-		var written, fileno int
-		var filename string
-		var file *os.File
-		var lz *lz4.Writer
-		var writer io.Writer
-		for encoded := range encodedQueue {
-			if file == nil {
-				filename = generateFilename(*outputfolder, encoded.Site, *recordsperfile, *buckets, *format, *compression)
-				f, err := os.Create(filename)
-				if err != nil {
-					log.Printf("Error creating output file %v: %v", filename, err)
-					os.Exit(1)
+	maxwriters := 1
+	if *recordsperfile == 1 {
+		maxwriters = runtime.NumCPU()
+	}
+	for i := 0; i < maxwriters; i++ {
+		writerWG.Add(1)
+		go func() {
+			var written, fileno int
+			var filename string
+			var file *os.File
+			var lz *lz4.Writer
+			var writer io.Writer
+			for encoded := range encodedQueue {
+				if file == nil {
+					filename = generateFilename(*outputfolder, encoded.Site, *recordsperfile, *buckets, *format, *compression)
+					f, err := os.Create(filename)
+					if err != nil {
+						log.Printf("Error creating output file %v: %v", filename, err)
+						os.Exit(1)
+					}
+					file = f
+					writer = f
+					if *compression {
+						lz = lz4.NewWriter(file)
+						lz.Apply(
+							lz4.CompressionLevelOption(lz4.Level9),
+							lz4.ConcurrencyOption(-1),
+							lz4.BlockSizeOption(lz4.Block4Mb),
+						)
+						writer = lz
+					}
 				}
-				file = f
-				writer = f
-				if *compression {
-					lz = lz4.NewWriter(file)
-					lz.Apply(
-						lz4.CompressionLevelOption(lz4.Level9),
-						lz4.ConcurrencyOption(-1),
-						lz4.BlockSizeOption(lz4.Block4Mb),
-					)
-					writer = lz
-				}
-			}
 
-			_, err := writer.Write(encoded.Data)
-			if err != nil {
-				log.Printf("Error writing output file %v: %v", filename, err)
-			}
-			written++
-			if written == *recordsperfile {
-				if *compression {
-					lz.Close()
+				_, err := writer.Write(encoded.Data)
+				if err != nil {
+					log.Printf("Error writing output file %v: %v", filename, err)
 				}
-				file.Close()
-				file = nil
-				written = 0
-				fileno++
+				written++
+				if written == *recordsperfile {
+					if *compression {
+						lz.Close()
+					}
+					file.Close()
+					file = nil
+					written = 0
+					fileno++
+				}
 			}
-		}
-		writerWG.Done()
-	}()
+			writerWG.Done()
+		}()
+	}
 
 	for _, site := range lines {
 		site = strings.Trim(site, "\r")
@@ -386,12 +438,12 @@ func generateFilename(folder, name string, itemsperfile, buckets int, format str
 	return filename
 }
 
-func generateJSON(data Result) []byte {
+func generateJSON(data turbograb.Result) []byte {
 	result, _ := json.Marshal(data)
 	return result
 }
 
-func generateTXT(data Result) []byte {
+func generateTXT(data turbograb.Result) []byte {
 	var buffer bytes.Buffer
 	buffer.Grow(len(data.Header) + len(data.Body) + 128)
 
