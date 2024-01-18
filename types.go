@@ -6,14 +6,14 @@ import "crypto/x509"
 
 //easyjson:json
 type Result struct {
-	Site         string              `json:"site,omitempty"`
-	URL          string              `json:"url,omitempty"`
-	Code         int                 `json:"resultcode,omitempty"`
-	Certificates []*x509.Certificate `json:"certificates,omitempty"`
-	Error        string              `json:"error,omitempty"`
-	Warnings     []string            `json:"warnings,omitempty"`
-	Body         string              `json:"body,omitempty"`
-	Header       string              `json:"headers,omitempty"`
+	Site         string              `json:"site,omitempty" bson:"site,omitempty"`
+	URL          string              `json:"url,omitempty" bson:"url,omitempty"`
+	Code         int                 `json:"resultcode,omitempty" bson:"resultcode,omitempty"`
+	Certificates []*x509.Certificate `json:"certificates,omitempty" bson:"certificates,omitempty"`
+	Error        string              `json:"error,omitempty" bson:"error,omitempty"`
+	Warnings     []string            `json:"warnings,omitempty" bson:"warnings,omitempty"`
+	Body         string              `json:"body,omitempty" bson:"body,omitempty"`
+	Header       string              `json:"headers,omitempty" bson:"headers,omitempty"`
 }
 
 type Encoded struct {
