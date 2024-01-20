@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,7 @@ func main() {
 	timeout := pflag.Int("timeout", 15, "Timeout after seconds")
 	maxretries := pflag.Int("retries", 10, "Max number of retries")
 	maxredirects := pflag.Int("redirects", 5, "Max number of redirects")
+	maxresponsesize := pflag.Int("maxresponsesize", 32*1024*1024, "Max response size in bytes")
 	useragent := pflag.String("useragent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.56", "User agent to send to server")
 	showerrors := pflag.Bool("showerrors", false, "Show errors")
 
@@ -51,15 +54,38 @@ func main() {
 	skipexisting := pflag.Bool("skipexisting", false, "Skip existing files, only works with perfile=1")
 
 	// Debugging
-	pprof := pflag.Bool("pprof", false, "Enable profiling")
+	pprofenable := pflag.Bool("pprof", false, "Enable profiling")
 
 	pflag.Parse()
 
-	if *pprof {
+	if *pprofenable {
 		go func() {
 			log.Println(http.ListenAndServe("localhost:6060", nil))
 		}()
 	}
+
+	go func() {
+		var ms runtime.MemStats
+		for {
+			time.Sleep(time.Millisecond * 50)
+			runtime.ReadMemStats(&ms)
+			if ms.HeapAlloc > 4*1024*1024*1024 {
+				log.Printf("FATAL MEMORY HOG ERROR: %d MB", ms.HeapAlloc/1024/1024)
+				f, err := os.Create("mem_profile.prof")
+				if err != nil {
+					panic(err)
+				}
+				defer f.Close()
+
+				err = pprof.WriteHeapProfile(f)
+				if err != nil {
+					panic(err)
+				}
+
+				panic("FATAL MEMORY HOG ERROR")
+			}
+		}
+	}()
 
 	timeoutDuration := time.Second * time.Duration(*timeout)
 
@@ -93,49 +119,57 @@ func main() {
 		progressbar.OptionShowCount(),
 	)
 
+	fasthttp.SetBodySizePoolLimit(65536, 65536)
+
 	// Producers
 	for i := 0; i < *parallel; i++ {
 		producerWG.Add(1)
 		go func() {
 			var certinfo []*x509.Certificate
-			secureclient := fasthttp.Client{
-				TLSConfig: &tls.Config{
-					VerifyPeerCertificate: storecertinfo(&certinfo),
-				},
-				NoDefaultUserAgentHeader: true,
-				ReadBufferSize:           128 * 1024,
-				WriteTimeout:             timeoutDuration,
-				ReadTimeout:              timeoutDuration,
+			securetls := &tls.Config{
+				VerifyPeerCertificate: storecertinfo(&certinfo),
 			}
-			insecureclient := fasthttp.Client{
-				TLSConfig: &tls.Config{
-					InsecureSkipVerify:    true,
-					VerifyPeerCertificate: storecertinfo(&certinfo),
-				},
-				NoDefaultUserAgentHeader: true,
-				ReadBufferSize:           128 * 1024,
-				WriteTimeout:             timeoutDuration,
-				ReadTimeout:              timeoutDuration,
+			insecuretls := &tls.Config{
+				InsecureSkipVerify:    true,
+				VerifyPeerCertificate: storecertinfo(&certinfo),
 			}
 
+			var hostclient *fasthttp.HostClient
 			var req *fasthttp.Request
 			var resp *fasthttp.Response
+			var requestshandled int
 
 			for site := range producerQueue {
 				var siteerr error
 				certinfo = nil
-				client := &secureclient
+
 				if *recordsperfile == 1 && *skipexisting {
 					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, *buckets, *format, *compression)); err == nil {
 						continue
 					}
 				}
+
 				retriesleft := *maxretries
 				redirectsleft := *maxredirects
 				var code int
 				var body, header, errstring string
-				protocol := "https"
 
+				if hostclient != nil && hostclient.ConnsCount() > 0 {
+					hostclient.CloseIdleConnections()
+					time.Sleep(time.Second * 2) // Wait for background cleanup goroutine to finish, sic
+				}
+
+				protocol := "https"
+				hostclient = &fasthttp.HostClient{
+					IsTLS:                    true,
+					TLSConfig:                securetls,
+					NoDefaultUserAgentHeader: true,
+					MaxResponseBodySize:      *maxresponsesize,
+					WriteTimeout:             timeoutDuration,
+					ReadTimeout:              timeoutDuration,
+					MaxConns:                 1,
+					MaxIdleConnDuration:      time.Millisecond * 1100, // A tiny amount more than the sleep interval
+				}
 				urlpathindex := 0
 				urlpath := (*urlpaths)[urlpathindex]
 
@@ -147,29 +181,52 @@ func main() {
 				host := site
 			retryloop:
 				for retriesleft > 0 {
-					siteurl, siteerr = url.JoinPath(protocol+"://"+host, urlpath)
-					if siteerr != nil {
-						log.Printf("Problem creating URL from %v, %v, %v: %v\n", protocol, host, urlpath, siteerr)
-						break
+					if protocol == "https" {
+						hostclient.IsTLS = true
+						hostclient.Addr = host + ":443"
+					} else if protocol == "http" {
+						hostclient.IsTLS = false
+						hostclient.Addr = host + ":80"
 					}
+
+					if !strings.HasPrefix(urlpath, "/") {
+						urlpath = "/" + urlpath
+					}
+
+					uri := fasthttp.AcquireURI()
+					uri.Parse(nil, []byte(protocol+"://"+host+urlpath))
 
 					if req != nil {
 						fasthttp.ReleaseRequest(req)
 						fasthttp.ReleaseResponse(resp)
 					}
+
 					req = fasthttp.AcquireRequest()
 					resp = fasthttp.AcquireResponse()
+
 					if closerequest {
 						req.SetConnectionClose()
 						resp.SetConnectionClose()
 					}
 
 					req.Header.SetUserAgent(*useragent)
-					req.SetRequestURI(siteurl)
-					siteerr = client.DoTimeout(req, resp, timeoutDuration)
+					req.SetURI(uri)
+					fasthttp.ReleaseURI(uri)
+
+					siteerr = hostclient.DoTimeout(req, resp, timeoutDuration)
+
+					requestshandled++
 
 					if siteerr == nil {
 						code = resp.Header.StatusCode()
+
+						if code == 200 || code == 206 {
+							body = string(resp.Body())
+							header = resp.Header.String()
+							errstring = ""
+							break retryloop
+						}
+
 						if fasthttp.StatusCodeIsRedirect(code) {
 							warnings = append(warnings, "redirect")
 
@@ -241,62 +298,59 @@ func main() {
 
 							protocol = newurl.Scheme
 							continue // retry
-						} else if code != 200 && urlpathindex+1 < len(*urlpaths) {
+						} else if urlpathindex+1 < len(*urlpaths) {
+							// Try another default URL
 							urlpathindex++
 							urlpath = (*urlpaths)[urlpathindex]
 
 							continue // retry
 						}
-
-						body = string(resp.Body())
-
-						header = resp.Header.String()
-						errstring = ""
-
-						break retryloop
-					}
-
-					code = 0
-					header = ""
-					body = ""
-
-					client.CloseIdleConnections()
-
-					if siteerr == fasthttp.ErrNoFreeConns {
-						time.Sleep(time.Second)
-						continue // try again, but it doesn't cost a retry
-					} else if _, ok := siteerr.(*net.DNSError); ok {
-						if !strings.HasPrefix(host, "www.") {
-							host = "www." + host
-							warnings = append(warnings, "prefix_www")
-							continue // loop without using a retry
-						}
-						// Just give up
-						break retryloop
-					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate is valid for") {
-						// Ignore bad certs
-						warnings = append(warnings, "tls_wrong_host")
-						client = &insecureclient
-					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate signed by unknown authority") {
-						warnings = append(warnings, "tls_unknown_authority")
-						client = &insecureclient
-					} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate has expired or is not yet valid") {
-						warnings = append(warnings, "tls_expired_cert")
-						client = &insecureclient
-					} else if siteerr.Error() == "remote error: tls: internal error" {
-						warnings = append(warnings, "unencrypted_http_failback")
-						protocol = "http"
-					} else if strings.Contains(siteerr.Error(), "connectex: No connection could be made because the target machine actively refused it") {
-						// Give up
-						warnings = append(warnings, "connection_refused")
-						break retryloop
-					} else if siteerr == fasthttp.ErrTooManyRedirects {
-						// Give up
-						break retryloop
-					} else if siteerr.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
-
 					} else {
-						// other errors
+						// There was an error
+						code = 0
+						header = ""
+						body = ""
+
+						if siteerr == fasthttp.ErrBodyTooLarge {
+							siteerr = fmt.Errorf("%v (%v bytes)", siteerr.Error(), resp.Header.ContentLength())
+							break retryloop
+						} else if siteerr == fasthttp.ErrNoFreeConns {
+							time.Sleep(time.Second)
+							continue // try again, but it doesn't cost a retry
+						} else if _, ok := siteerr.(*net.DNSError); ok {
+							if !strings.HasPrefix(host, "www.") {
+								host = "www." + host
+								warnings = append(warnings, "prefix_www")
+								continue // loop without using a retry
+							}
+							// Just give up
+							break retryloop
+						} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate is valid for") {
+							// Ignore bad certs
+							warnings = append(warnings, "tls_wrong_host")
+							hostclient.TLSConfig = insecuretls
+						} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate signed by unknown authority") {
+							warnings = append(warnings, "tls_unknown_authority")
+							hostclient.TLSConfig = insecuretls
+						} else if strings.Contains(siteerr.Error(), "tls: failed to verify certificate: x509: certificate has expired or is not yet valid") {
+							warnings = append(warnings, "tls_expired_cert")
+							hostclient.TLSConfig = insecuretls
+						} else if siteerr.Error() == "remote error: tls: internal error" {
+							warnings = append(warnings, "unencrypted_http_failback")
+							protocol = "http"
+						} else if strings.Contains(siteerr.Error(), "connectex: No connection could be made because the target machine actively refused it") {
+							// Give up
+							warnings = append(warnings, "connection_refused")
+							break retryloop
+						} else if siteerr == fasthttp.ErrTooManyRedirects {
+							// Give up
+							break retryloop
+						} else if siteerr.Error() == "the server closed connection before returning the first response byte. Make sure the server returns 'Connection: close' response header before closing the connection" {
+
+						} else {
+							// other errors
+							warnings = append(warnings, strings.ReplaceAll(siteerr.Error(), " ", "_"))
+						}
 					}
 
 					time.Sleep(time.Second)
@@ -318,6 +372,11 @@ func main() {
 					errstring = siteerr.Error()
 				}
 
+				// Unique warnings only
+				slices.Sort(warnings)
+				warnings = slices.Compact(warnings)
+
+				// Ship it!
 				result := turbograb.Result{
 					Site:         site,
 					URL:          siteurl,
