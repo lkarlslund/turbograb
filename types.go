@@ -8,6 +8,7 @@ import "crypto/x509"
 type Result struct {
 	Site         string              `json:"site,omitempty" bson:"site,omitempty"`
 	URL          string              `json:"url,omitempty" bson:"url,omitempty"`
+	IPaddress    string              `json:"ip,omitempty" bson:"ip,omitempty"`
 	Code         int                 `json:"resultcode,omitempty" bson:"resultcode,omitempty"`
 	Certificates []*x509.Certificate `json:"certificates,omitempty" bson:"certificates,omitempty"`
 	Error        string              `json:"error,omitempty" bson:"error,omitempty"`

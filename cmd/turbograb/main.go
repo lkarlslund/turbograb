@@ -33,7 +33,7 @@ import (
 
 func main() {
 	// Grabbing data
-	sitelist := pflag.String("sitelist", "", "File to read sites from, plain text")
+	sitelist := pflag.String("sitelist", "", "File to read sites from (plain text) or comma separated list")
 
 	urlpaths := pflag.StringSlice("urlpath", []string{"/"}, "Path to grab")
 	storecodes := pflag.IntSlice("storecodes", nil, "Return codes to store data from (default blank, means save all)")
@@ -51,7 +51,7 @@ func main() {
 	compression := pflag.Bool("compress", false, "Store LZ4 compressed")
 	recordsperfile := pflag.Int("perfile", 10000, "Number of records in each file")
 	buckets := pflag.Int("buckets", 4096, "Number of buckets to place files in")
-	skipexisting := pflag.Bool("skipexisting", false, "Skip existing files, only works with perfile=1")
+	skipnewerthan := pflag.Int("skipnewerthan", 7*1440, "Skip existing files that are newer than N minutes, only works with perfile=1")
 
 	// Debugging
 	pprofenable := pflag.Bool("pprof", false, "Enable profiling")
@@ -75,12 +75,12 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
-				defer f.Close()
 
 				err = pprof.WriteHeapProfile(f)
 				if err != nil {
 					panic(err)
 				}
+				f.Close()
 
 				panic("FATAL MEMORY HOG ERROR")
 			}
@@ -97,20 +97,33 @@ func main() {
 		}
 	}
 
-	rawsites, err := os.ReadFile(*sitelist)
-	if err != nil {
-		log.Println("Error reading sitelist file:", err)
+	var sites []string
+	if !strings.Contains(*sitelist, ",") {
+		rawsites, err := os.ReadFile(*sitelist)
+		if err != nil {
+			if !strings.Contains(*sitelist, "/") || !strings.HasSuffix(*sitelist, "\\") {
+				log.Printf("Sitelist file %v not found, assuming it's a hostname", *sitelist)
+				sites = []string{*sitelist}
+			} else {
+				log.Println("Error reading sitelist file:", err)
+				os.Exit(1)
+			}
+		} else {
+			sites = strings.Split(string(rawsites), "\n")
+		}
+	} else if !strings.Contains(*sitelist, "/") || !strings.HasSuffix(*sitelist, "\\") {
+		sites = strings.Split(*sitelist, ",")
+	} else {
+		log.Println("Sitelist parameter is not a file or a list of hostnames")
 		os.Exit(1)
 	}
-
-	lines := strings.Split(string(rawsites), "\n")
 
 	var producerWG, writerWG sync.WaitGroup
 	producerQueue := make(chan string, *parallel*4)
 
 	encodedQueue := make(chan turbograb.Encoded, runtime.NumCPU()*4)
 
-	pb := progressbar.NewOptions(len(lines),
+	pb := progressbar.NewOptions(len(sites),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionSetItsString("conn"),
 		progressbar.OptionThrottle(time.Second*2),
@@ -143,16 +156,18 @@ func main() {
 				var siteerr error
 				certinfo = nil
 
-				if *recordsperfile == 1 && *skipexisting {
-					if _, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, *buckets, *format, *compression)); err == nil {
-						continue
+				if *recordsperfile == 1 && *skipnewerthan > 0 {
+					if stat, err := os.Stat(generateFilename(*outputfolder, site, *recordsperfile, *buckets, *format, *compression)); err == nil {
+						if time.Since(stat.ModTime()) < time.Minute*time.Duration(*skipnewerthan) {
+							continue
+						}
 					}
 				}
 
 				retriesleft := *maxretries
 				redirectsleft := *maxredirects
 				var code int
-				var body, header, errstring string
+				var ipaddress, body, header, errstring string
 
 				if hostclient != nil && hostclient.ConnsCount() > 0 {
 					hostclient.CloseIdleConnections()
@@ -194,7 +209,10 @@ func main() {
 					}
 
 					uri := fasthttp.AcquireURI()
-					uri.Parse(nil, []byte(protocol+"://"+host+urlpath))
+					siteerr = uri.Parse(nil, []byte(protocol+"://"+host+urlpath))
+					if siteerr != nil {
+						break retryloop
+					}
 
 					if req != nil {
 						fasthttp.ReleaseRequest(req)
@@ -216,6 +234,8 @@ func main() {
 					siteerr = hostclient.DoTimeout(req, resp, timeoutDuration)
 
 					requestshandled++
+
+					ipaddress = resp.RemoteAddr().String()
 
 					if siteerr == nil {
 						code = resp.Header.StatusCode()
@@ -383,6 +403,7 @@ func main() {
 					Certificates: certinfo,
 					Header:       header,
 					Body:         body,
+					IPaddress:    ipaddress,
 					Code:         code,
 					Error:        errstring,
 					Warnings:     warnings,
@@ -431,11 +452,14 @@ func main() {
 					writer = f
 					if *compression {
 						lz = lz4.NewWriter(file)
-						lz.Apply(
+						err = lz.Apply(
 							lz4.CompressionLevelOption(lz4.Level9),
 							lz4.ConcurrencyOption(-1),
 							lz4.BlockSizeOption(lz4.Block4Mb),
 						)
+						if err != nil {
+							log.Printf("Error creating lz4 writer: %v", err)
+						}
 						writer = lz
 					}
 				}
@@ -459,7 +483,7 @@ func main() {
 		}()
 	}
 
-	for _, site := range lines {
+	for _, site := range sites {
 		site = strings.Trim(site, "\r")
 		producerQueue <- site
 		pb.Add(1)
@@ -525,6 +549,9 @@ func generateTXT(data turbograb.Result) []byte {
 		buffer.WriteString(data.Error)
 		buffer.WriteString("\n")
 	} else {
+		buffer.WriteString("*IP: ")
+		buffer.WriteString(data.IPaddress)
+		buffer.WriteString("\n")
 		buffer.WriteString(fmt.Sprintf("*Resultcode: %v\n", data.Code))
 	}
 
